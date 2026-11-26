@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 app = Flask(__name__)
 DB_PATH = 'tasks.db'
+MAX_PER_PAGE = 100
 
 
 def init_db():
@@ -47,21 +48,29 @@ def index():
 @app.route('/api/tasks', methods=['GET'])
 def get_tasks():
     status = request.args.get('status', 'all')
-    page = int(request.args.get('page', 1))
-    per_page = int(request.args.get('per_page', 10))
+    try:
+        page = max(1, int(request.args.get('page', 1)))
+        per_page = min(max(1, int(request.args.get('per_page', 10))), MAX_PER_PAGE)
+    except ValueError:
+        return jsonify({"error": "page and per_page must be integers"}), 400
 
     conn = get_db()
     c = conn.cursor()
     query = "SELECT * FROM tasks"
+    params = []
+    
+    # FIX 1a и 1b: правильные фильтры
     if status == 'active':
-        query += " WHERE completed = 1"        # BUG 1a
+        query += " WHERE completed = 0"
     elif status == 'completed':
-        query += " WHERE completed = 0"        # BUG 1b
+        query += " WHERE completed = 1"
 
     offset = (page - 1) * per_page
-    query += f" ORDER BY created_at DESC LIMIT {per_page - 1} OFFSET {offset}"  # BUG 2
+    # FIX 2: правильный LIMIT и параметризация
+    query += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+    params.extend([per_page, offset])
 
-    rows = c.execute(query).fetchall()
+    rows = c.execute(query, params).fetchall()
     conn.close()
     return jsonify([dict(r) for r in rows])
 
@@ -69,26 +78,34 @@ def get_tasks():
 @app.route('/api/tasks/search', methods=['GET'])
 def search_tasks():
     q = request.args.get('q', '')
+    # FIX 3: защита от SQL-инъекций через параметризацию и экранирование
+    escaped = q.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
     conn = get_db()
     c = conn.cursor()
-    query = f"SELECT * FROM tasks WHERE title LIKE '%{q}%'"   # BUG 3: SQL-инъекция
-    try:
-        rows = c.execute(query).fetchall()
-        result = [dict(r) for r in rows]
-    except Exception as e:
-        result = {"error": str(e)}
+    rows = c.execute(
+        "SELECT * FROM tasks WHERE title LIKE ? ESCAPE '\\'",
+        (f"%{escaped}%",),
+    ).fetchall()
     conn.close()
-    return jsonify(result)
+    return jsonify([dict(r) for r in rows])
 
 
 @app.route('/api/tasks', methods=['POST'])
 def create_task():
     data = request.get_json() or {}
-    title = data.get('title', '')            # BUG 4: нет валидации пустого title
-    description = data.get('description', '')
-    priority = data.get('priority', 1)
-    created_at = datetime.now(timezone.utc).isoformat()
+    
+    # FIX 4: валидация title
+    title = (data.get('title') or '').strip()
+    if not title:
+        return jsonify({"error": "title is required"}), 400
+        
+    description = data.get('description', '') or ''
+    try:
+        priority = int(data.get('priority', 1))
+    except (TypeError, ValueError):
+        return jsonify({"error": "priority must be an integer"}), 400
 
+    created_at = datetime.now(timezone.utc).isoformat()
     conn = get_db()
     c = conn.cursor()
     c.execute(
@@ -99,7 +116,8 @@ def create_task():
     conn.commit()
     task_id = c.lastrowid
     conn.close()
-    return jsonify({"id": task_id, "message": "created"}), 200   # BUG 5: должно быть 201
+    # FIX 5: возвращаем 201 Created
+    return jsonify({"id": task_id, "message": "created"}), 201
 
 
 @app.route('/api/tasks/<int:task_id>', methods=['PUT'])
@@ -107,12 +125,26 @@ def update_task(task_id):
     data = request.get_json() or {}
     conn = get_db()
     c = conn.cursor()
+    updated = False
+    
+    # FIX 6: добавлен WHERE id = ?
     if 'completed' in data:
-        c.execute("UPDATE tasks SET completed = ?", (data['completed'],))   # BUG 6: нет WHERE
+        c.execute("UPDATE tasks SET completed = ? WHERE id = ?",
+                  (1 if data['completed'] else 0, task_id))
+        updated = updated or c.rowcount > 0
+        
     if 'title' in data:
-        c.execute("UPDATE tasks SET title = ? WHERE id = ?", (data['title'], task_id))
+        new_title = (data['title'] or '').strip()
+        if not new_title:
+            conn.close()
+            return jsonify({"error": "title cannot be empty"}), 400
+        c.execute("UPDATE tasks SET title = ? WHERE id = ?", (new_title, task_id))
+        updated = updated or c.rowcount > 0
+        
     conn.commit()
     conn.close()
+    if not updated:
+        return jsonify({"error": "not found or nothing to update"}), 404
     return jsonify({"message": "updated"})
 
 
@@ -120,9 +152,13 @@ def update_task(task_id):
 def delete_task(task_id):
     conn = get_db()
     c = conn.cursor()
-    c.execute("UPDATE tasks SET completed = 1 WHERE id = ?", (task_id,))   # BUG 7: soft-delete
+    # FIX 7: реальное удаление из БД
+    c.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+    deleted = c.rowcount
     conn.commit()
     conn.close()
+    if deleted == 0:
+        return jsonify({"error": "not found"}), 404
     return jsonify({"message": "deleted"})
 
 
@@ -133,7 +169,8 @@ def stats():
     total = c.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
     completed = c.execute("SELECT COUNT(*) FROM tasks WHERE completed = 1").fetchone()[0]
     conn.close()
-    rate = (completed / total) if total > 0 else 0    # BUG 8: доля, а не проценты
+    # FIX 8: возвращаем проценты, а не долю
+    rate = round(completed / total * 100, 2) if total > 0 else 0
     return jsonify({
         "total": total,
         "completed": completed,
